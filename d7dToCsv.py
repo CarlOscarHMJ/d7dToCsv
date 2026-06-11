@@ -5,13 +5,18 @@ Usage:
     python d7dToCsv.py                         interactive mode
     python d7dToCsv.py input.d7d [output_directory]
     python d7dToCsv.py "Tunneldata/*.d7d" out/
+    python d7dToCsv.py "Tunneldata/*.d7d" out/ --workers 4
+    python d7dToCsv.py "Tunneldata/*.d7d" --workers 1   (serial)
 
     Or as a module:
     from d7dToCsv import d7dToCsv
     d7dToCsv("input.d7d", "output.csv")
 """
 
+import argparse
+import atexit
 import glob
+import multiprocessing
 import os
 import sys
 import time
@@ -200,6 +205,8 @@ def _formatProgress(current, total, elapsed):
     bar += " " * (PROGRESS_BAR_WIDTH - filled - 1) + "]"
 
     pct = int(fraction * 100)
+
+    # ETA assumes uniform conversion speed across all remaining files
     eta = (elapsed / current) * (total - current) if current else 0
 
     return f"\r  {bar} {current}/{total} ({pct}%)  ETA: {_formatDuration(eta)}  "
@@ -218,27 +225,168 @@ def _formatDuration(seconds):
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker state and helpers
+# ---------------------------------------------------------------------------
+
+_workerDll = None
+_progressState = None
+_workerIndex = None
+
+
+def _initWorker(progressState, nextIdCounter):
+    """Initialise a worker process: open DLL, claim worker ID, register cleanup."""
+
+    global _workerDll, _progressState, _workerIndex
+
+    _progressState = progressState
+    with nextIdCounter.get_lock():
+        _workerIndex = nextIdCounter.value
+        nextIdCounter.value += 1
+
+    _workerDll = DWDataReader.open_dll()
+    atexit.register(_cleanupWorker)
+
+
+def _cleanupWorker():
+    """Close the worker's DLL handle on process exit."""
+
+    global _workerDll
+    if _workerDll is not None:
+        DWDataReader.close_dll(_workerDll)
+        _workerDll = None
+
+
+def _processChunk(chunk):
+    """Process a chunk of .d7d files sequentially in one worker process.
+
+    Returns (successPaths, errors) where errors is a list of (path, msg) tuples.
+    """
+
+    global _workerIndex, _progressState, _workerDll
+
+    workerId = _workerIndex
+    nChunk = len(chunk)
+
+    firstFile = chunk[0][0] if chunk else ""
+    _progressState[workerId] = (0, nChunk, os.path.basename(firstFile))
+
+    successPaths = []
+    errors = []
+
+    for i, (d7dPath, csvPath) in enumerate(chunk):
+        try:
+            result = _convertOneFile(d7dPath, csvPath, _workerDll)
+            successPaths.append(result)
+        except Exception as e:
+            errors.append((d7dPath, str(e)))
+
+        nextFile = chunk[i + 1][0] if i + 1 < nChunk else ""
+        _progressState[workerId] = (i + 1, nChunk, os.path.basename(nextFile))
+
+    return successPaths, errors
+
+
+def _chunkTasks(tasks, nChunks):
+    """Distribute tasks evenly across nChunks using round-robin."""
+
+    if nChunks >= len(tasks):
+        return [[task] for task in tasks]
+
+    chunks = [[] for _ in range(nChunks)]
+    for i, task in enumerate(tasks):
+        chunks[i % nChunks].append(task)
+    return chunks
+
+
+def _renderWorkerDisplay(progressState, nWorkers, nFiles, startTime):
+    """Build multi-line progress display showing per-worker and overall bars.
+
+    Returns (displayString, totalCompleted).
+    """
+
+    lines = []
+    totalCompleted = 0
+
+    for w in range(nWorkers):
+        state = progressState.get(w)
+        if state is None:
+            continue
+        completed, total, currentFile = state
+        totalCompleted += completed
+
+        fraction = completed / total if total else 0
+        filled = int(PROGRESS_BAR_WIDTH * fraction)
+        bar = "[" + "=" * filled + ">" * (1 if filled < PROGRESS_BAR_WIDTH else 0)
+        bar += " " * (PROGRESS_BAR_WIDTH - filled - 1) + "]"
+        pct = int(fraction * 100)
+
+        fileDisplay = currentFile if currentFile else "done"
+        lines.append(
+            f"  W{w + 1:2d} {bar} {completed:3d}/{total:3d} ({pct:3d}%)  {fileDisplay}"
+        )
+
+    elapsed = time.time() - startTime
+    fraction = totalCompleted / nFiles if nFiles else 0
+    filled = int(PROGRESS_BAR_WIDTH * fraction)
+    bar = "[" + "=" * filled + ">" * (1 if filled < PROGRESS_BAR_WIDTH else 0)
+    bar += " " * (PROGRESS_BAR_WIDTH - filled - 1) + "]"
+    pct = int(fraction * 100)
+    eta = (elapsed / totalCompleted) * (nFiles - totalCompleted) if totalCompleted else 0
+
+    lines.append(
+        f"  Tot  {bar} {totalCompleted}/{nFiles} ({pct}%)  ETA: {_formatDuration(eta)}"
+    )
+
+    return "\n".join(lines), totalCompleted
+
+
+# ---------------------------------------------------------------------------
 # Batch runner
 # ---------------------------------------------------------------------------
 
 
-def _runBatchMode(d7dPaths, outDir):
-    """Convert a list of .d7d files with progress display."""
+def _runBatchMode(d7dPaths, outDir, workers=None):
+    """Convert a list of .d7d files, in parallel by default.
+
+    workers: Number of parallel workers. None = auto (N-1 cores), 1 = serial.
+    """
 
     if outDir:
         os.makedirs(outDir, exist_ok=True)
 
     nFiles = len(d7dPaths)
-    print(f"Found {nFiles} file(s). Converting...\n")
 
+    tasks = []
+    for d7dPath in d7dPaths:
+        baseName = os.path.splitext(os.path.basename(d7dPath))[0] + ".csv"
+        csvPath = os.path.join(outDir, baseName) if outDir else None
+        tasks.append((d7dPath, csvPath))
+
+    if workers is None:
+        cpuCount = os.cpu_count() or 1
+        workers = max(1, cpuCount - 1)
+
+    print(f"Found {nFiles} file(s). Converting with {workers} worker(s)...\n")
+
+    if workers == 1:
+        _runSerial(tasks)
+    else:
+        _runParallel(tasks, workers)
+
+
+def _runSerial(tasks):
+    """Convert files one at a time (single process, single DLL handle)."""
+
+    nFiles = len(tasks)
+    errors = []
     dll = DWDataReader.open_dll()
     try:
         startTime = time.time()
-        for i, d7dPath in enumerate(d7dPaths, 1):
-            baseName = os.path.splitext(os.path.basename(d7dPath))[0] + ".csv"
-            csvPath = os.path.join(outDir, baseName) if outDir else None
-            _convertOneFile(d7dPath, csvPath, dll)
-
+        for i, (d7dPath, csvPath) in enumerate(tasks, 1):
+            try:
+                _convertOneFile(d7dPath, csvPath, dll)
+            except Exception as e:
+                errors.append((d7dPath, str(e)))
             elapsed = time.time() - startTime
             print(_formatProgress(i, nFiles, elapsed), end="")
             sys.stdout.flush()
@@ -246,7 +394,89 @@ def _runBatchMode(d7dPaths, outDir):
         DWDataReader.close_dll(dll)
 
     totalTime = time.time() - startTime
-    print(f"\n\nDone. {nFiles} file(s) converted in {_formatDuration(totalTime)}.")
+    print()
+    if errors:
+        print(f"\n{len(errors)} file(s) failed:")
+        for path, err in errors:
+            print(f"  {path}: {err}")
+        print()
+
+    successCount = nFiles - len(errors)
+    print(f"\nDone. {successCount}/{nFiles} file(s) converted in {_formatDuration(totalTime)}.")
+
+
+def _runParallel(tasks, workers):
+    """Convert files in parallel using a process pool.
+
+    Each worker process opens its own DLL handle once and reuses it
+    for its entire chunk.  Per-worker progress bars are displayed
+    alongside an overall progress bar with ETA.  Errors are collected
+    per-file rather than crashing the batch.
+    """
+
+    nFiles = len(tasks)
+    actualWorkers = min(workers, nFiles)
+    chunks = _chunkTasks(tasks, actualWorkers)
+
+    manager = multiprocessing.Manager()
+    progressState = manager.dict()
+    nextIdCounter = multiprocessing.Value("i", 0)
+
+    for w in range(actualWorkers):
+        progressState[w] = None
+
+    startTime = time.time()
+
+    with multiprocessing.Pool(
+        actualWorkers,
+        initializer=_initWorker,
+        initargs=(progressState, nextIdCounter),
+    ) as pool:
+        asyncResults = [
+            pool.apply_async(_processChunk, (chunk,)) for chunk in chunks
+        ]
+
+        prevLineCount = 0
+        while not all(r.ready() for r in asyncResults):
+            displayStr, _ = _renderWorkerDisplay(
+                progressState, actualWorkers, nFiles, startTime
+            )
+            if prevLineCount:
+                sys.stdout.write(f"\033[{prevLineCount}A")
+            sys.stdout.write("\033[J")
+            sys.stdout.write(displayStr + "\n")
+            sys.stdout.flush()
+            prevLineCount = displayStr.count("\n") + 1
+            time.sleep(0.3)
+
+        # Final render
+        displayStr, completed = _renderWorkerDisplay(
+            progressState, actualWorkers, nFiles, startTime
+        )
+        if prevLineCount:
+            sys.stdout.write(f"\033[{prevLineCount}A")
+        sys.stdout.write("\033[J")
+        sys.stdout.write(displayStr + "\n")
+        sys.stdout.flush()
+
+        allErrors = []
+        for r in asyncResults:
+            _, errors = r.get()
+            allErrors.extend(errors)
+
+    totalTime = time.time() - startTime
+    print()
+    if allErrors:
+        print(f"{len(allErrors)} file(s) failed:")
+        for path, err in allErrors:
+            print(f"  {path}: {err}")
+        print()
+
+    successCount = nFiles - len(allErrors)
+    print(
+        f"Done. {successCount}/{nFiles} file(s) converted"
+        f" in {_formatDuration(totalTime)} using {actualWorkers} workers."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +499,13 @@ def _runInteractiveMode():
         print("No input specified. Exiting.")
         sys.exit(0)
 
-    d7dPaths = sorted(glob.glob(pattern))
+    allPaths = sorted(glob.glob(pattern))
+    d7dPaths = [p for p in allPaths if p.lower().endswith(".d7d")]
+    skipped = len(allPaths) - len(d7dPaths)
+    if skipped:
+        print(f"\nSkipped {skipped} non-.d7d file(s).")
     if not d7dPaths:
-        print(f"No files match: {pattern}")
+        print(f"No .d7d files match: {pattern}")
         sys.exit(1)
 
     print(f"\nFound {len(d7dPaths)} .d7d file(s):")
@@ -293,13 +527,28 @@ def _runInteractiveMode():
         outDir = None
 
     print()
-    confirm = input(f"Start conversion? [Y/n] ").strip().lower()
+    cpuCount = os.cpu_count() or 1
+    defaultWorkers = max(1, cpuCount - 1)
+    workersInput = input(
+        f"Number of workers [default: {defaultWorkers} (N-1 cores)]: "
+    ).strip()
+    if workersInput:
+        try:
+            workers = int(workersInput)
+        except ValueError:
+            print("Invalid number. Using default.")
+            workers = None
+    else:
+        workers = None
+
+    print()
+    confirm = input("Start conversion? [Y/n] ").strip().lower()
     if confirm and confirm != "y":
         print("Cancelled.")
         sys.exit(0)
 
     print()
-    _runBatchMode(d7dPaths, outDir)
+    _runBatchMode(d7dPaths, outDir, workers=workers)
 
     try:
         input("\nPress Enter to exit.")
@@ -313,17 +562,44 @@ def _runInteractiveMode():
 
 
 def main():
-    if len(sys.argv) < 2:
+    parser = argparse.ArgumentParser(
+        description="Convert DEWESoft .d7d files to CSV format."
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help="Input file or glob pattern (e.g. 'data/*.d7d')",
+    )
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default=None,
+        help="Output directory for CSV files",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: N-1 cores, 1 = serial)",
+    )
+
+    args = parser.parse_args()
+
+    if not args.input:
         _runInteractiveMode()
         return
 
-    d7dPaths = sorted(glob.glob(sys.argv[1]))
+    allPaths = sorted(glob.glob(args.input))
+    d7dPaths = [p for p in allPaths if p.lower().endswith(".d7d")]
+    skipped = len(allPaths) - len(d7dPaths)
+    if skipped:
+        print(f"Skipped {skipped} non-.d7d file(s).")
     if not d7dPaths:
-        print(f"Error: no files match: {sys.argv[1]}")
+        print(f"Error: no .d7d files match: {args.input}")
         sys.exit(1)
 
-    outDir = sys.argv[2] if len(sys.argv) > 2 else None
-    _runBatchMode(d7dPaths, outDir)
+    _runBatchMode(d7dPaths, args.output, workers=args.workers)
 
 
 if __name__ == "__main__":
