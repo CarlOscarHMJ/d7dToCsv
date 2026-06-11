@@ -2,11 +2,11 @@
 d7dToCsv  Convert DEWESoft .d7d files to CSV format.
 
 Usage:
-    python d7dToCsv.py                         interactive mode
-    python d7dToCsv.py input.d7d [output_directory]
-    python d7dToCsv.py "Tunneldata/*.d7d" out/
-    python d7dToCsv.py "Tunneldata/*.d7d" out/ --workers 4
-    python d7dToCsv.py "Tunneldata/*.d7d" --workers 1   (serial)
+    python d7dToCsv.py                         interactive mode (asks for input only)
+    python d7dToCsv.py input.d7d               converts to CSV alongside input
+    python d7dToCsv.py input.d7d out/          writes CSV to out/
+    python d7dToCsv.py "data/*.d7d" out/       batch with glob pattern
+    python d7dToCsv.py "data/*.d7d" --workers 1   serial mode
 
     Or as a module:
     from d7dToCsv import d7dToCsv
@@ -485,7 +485,7 @@ def _runParallel(tasks, workers):
 
 
 def _runInteractiveMode():
-    """Prompt the user for input pattern and output directory, then convert."""
+    """Prompt the user for an input pattern, then convert using defaults."""
 
     print("=" * 50)
     print("  d7d2csv  -  DEWESoft .d7d to CSV converter")
@@ -513,47 +513,7 @@ def _runInteractiveMode():
         print(f"  {path}")
 
     print()
-    print("Output folder:")
-    print("  [1] Same as input file(s)")
-    print("  [2] Custom folder")
-
-    choice = input("Choice (1/2): ").strip()
-    if choice == "2":
-        outDir = input("Enter output folder: ").strip()
-        if not outDir:
-            print("No output folder given. Exiting.")
-            sys.exit(0)
-    else:
-        outDir = None
-
-    print()
-    cpuCount = os.cpu_count() or 1
-    defaultWorkers = max(1, cpuCount - 1)
-    workersInput = input(
-        f"Number of workers [default: {defaultWorkers} (N-1 cores)]: "
-    ).strip()
-    if workersInput:
-        try:
-            workers = int(workersInput)
-        except ValueError:
-            print("Invalid number. Using default.")
-            workers = None
-    else:
-        workers = None
-
-    print()
-    confirm = input("Start conversion? [Y/n] ").strip().lower()
-    if confirm and confirm != "y":
-        print("Cancelled.")
-        sys.exit(0)
-
-    print()
-    _runBatchMode(d7dPaths, outDir, workers=workers)
-
-    try:
-        input("\nPress Enter to exit.")
-    except (EOFError, OSError):
-        pass
+    _runBatchMode(d7dPaths, None, workers=None)
 
 
 # ---------------------------------------------------------------------------
