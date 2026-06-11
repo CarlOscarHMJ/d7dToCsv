@@ -1,0 +1,13 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output
+exportFolder/
+
+# Input data files (large binaries)
+testDataToBeConverted/*.d7d
